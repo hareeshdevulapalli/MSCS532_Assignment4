@@ -1,0 +1,13 @@
+algorithm,distribution,n,comparisons,ratio_to_nlgn
+Heapsort,sorted,20000,529074,1.852
+Heapsort,reverse,20000,493307,1.726
+Heapsort,random,20000,510938,1.788
+Heapsort,few-unique,20000,471228,1.649
+Quicksort,sorted,20000,512778,1.794
+Quicksort,reverse,20000,494491,1.73
+Quicksort,random,20000,532211,1.862
+Quicksort,few-unique,20000,91504,0.32
+Merge Sort,sorted,20000,139216,0.487
+Merge Sort,reverse,20000,148016,0.518
+Merge Sort,random,20000,260857,0.913
+Merge Sort,few-unique,20000,252248,0.883
