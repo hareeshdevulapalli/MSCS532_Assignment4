@@ -37,22 +37,22 @@ The algorithm has three parts.
 
 | Function | What it does |
 |---|---|
-| `max_heapify(a, i, heap_size)` | Assumes both subtrees of `i` are heaps. Swaps `a[i]` with its larger child until neither child is larger. |
-| `build_max_heap(a)` | Calls `max_heapify` on the internal nodes `n//2 - 1` down to `0`. Nodes `n//2` and above are leaves, which are already one-element heaps. |
-| `heapsort(a)` | Builds the heap. Then, for `end = n-1` down to `1`, swaps the maximum `a[0]` into `a[end]`, shrinks the heap to `a[0:end]`, and re-heapifies the root. |
+| `heapify(arr, root, size)` | Assumes both subtrees of `root` are heaps. Swaps `arr[root]` with its larger child until neither child is larger. |
+| `build_heap(arr)` | Calls `heapify` on the internal nodes `n//2 - 1` down to `0`. Nodes `n//2` and above are leaves, which are already one-element heaps. |
+| `heap_sort(arr)` | Builds the heap. Then, for `last = n-1` down to `1`, swaps the maximum `arr[0]` into `arr[last]`, shrinks the heap to `arr[0:last]`, and re-heapifies the root. |
 
 The heap and the sorted output share the same list. The heap occupies the prefix and the
 sorted suffix grows from the right, so the sort is in place.
 
 Implementation choices:
 
-* **Iterative `max_heapify`.** CLRS writes MAX-HEAPIFY as a tail-recursive procedure. A
+* **Iterative `heapify`.** CLRS writes MAX-HEAPIFY as a tail-recursive procedure. A
   `while` loop does the same thing without a Python function call per level, and the code
   never needs a call stack deeper than one frame.
 * **Only `<` is used.** Any mutually comparable values can be sorted: ints, floats,
   strings, tuples, or objects that define `__lt__`. This also let the benchmark count
   comparisons by wrapping values in a class whose `__lt__` increments a counter.
-* **`heapsorted(iterable)`** is a convenience wrapper that copies its input first, like
+* **`heap_sorted(values)`** is a convenience wrapper that copies its input first, like
   the built-in `sorted()`.
 
 ## 2. Heapsort analysis
@@ -81,8 +81,8 @@ quarter cost at most one level, and so on.
 
 ### 2.3 Extraction phase: O(n lg n)
 
-The loop runs n − 1 times. Each iteration does one swap in O(1) and one `max_heapify(a, 0,
-end)` on a heap of `end` elements, which costs O(lg end) ≤ O(lg n). The total is
+The loop runs n − 1 times. Each iteration does one swap in O(1) and one `heapify(arr, 0,
+last)` on a heap of `last` elements, which costs O(lg last) ≤ O(lg n). The total is
 
 $$
 \sum_{k=2}^{n} O(\lg k) \;=\; O(\lg n!) \;=\; O(n \lg n),
@@ -97,7 +97,7 @@ because lg n! = Θ(n lg n) by Stirling's approximation.
 | **Worst** | **Θ(n lg n)** | The upper bound is O(n) + O(n lg n) from §2.2–2.3. The lower bound holds for any comparison sort: a decision tree with n! leaves has height at least lg n! = Ω(n lg n). |
 | **Average** | **Θ(n lg n)** | It cannot exceed the worst case. The decision-tree argument also bounds the average: a binary tree with n! leaves has average leaf depth at least lg n!. So no comparison sort averages better than Ω(n lg n). |
 | **Best, distinct keys** | **Θ(n lg n)** | See below. |
-| **Best, all keys equal** | **Θ(n)** | Every `max_heapify` stops after its first two comparisons, because no child is *strictly* larger. This gives exactly 3n comparisons, measured: 59,994 for n = 20,000. |
+| **Best, all keys equal** | **Θ(n)** | Every `heapify` call stops after its first two comparisons, because no child is *strictly* larger. This gives exactly 3n comparisons, measured: 59,994 for n = 20,000. |
 
 **Why the time is n lg n even on "easy" input.** For most sorting algorithms, input order
 changes the running time. Insertion sort is Θ(n) on sorted input. Quicksort with a fixed
@@ -105,7 +105,7 @@ pivot is Θ(n²) on sorted input. Heapsort is unusual because the input order ca
 the build phase, which is O(n) in every case. The extraction phase always behaves the same
 way:
 
-1. The element swapped into the root is `a[end]`, the last leaf of the current heap.
+1. The element swapped into the root is `arr[last]`, the last leaf of the current heap.
 2. A leaf of a max-heap tends to be one of the smallest elements present. Every one of its
    ancestors must be at least as large, so it is a poor candidate for the root.
 3. That small element therefore sinks most of the way back down: about lg n levels, with
@@ -138,7 +138,7 @@ so the build phase is just comparisons.
 ### 2.5 Space complexity and overheads
 
 * **Auxiliary space: O(1).** The sort rearranges the input list and uses only a few index
-  variables. Because `max_heapify` is iterative, there is no recursion stack. The recursive
+  variables. Because `heapify` is iterative, there is no recursion stack. The recursive
   CLRS version would use O(lg n) stack frames.
 * **Not stable.** The long-distance swaps (root ↔ last leaf) can reorder equal keys.
   Sorting `[(2,'b'), (2,'a')]` by first field does not guarantee `'b'` stays first.
@@ -155,7 +155,7 @@ so the build phase is just comparisons.
 
 ## 3. Empirical comparison with Quicksort and Merge Sort
 
-File: [`benchmark.py`](benchmark.py). Baselines are in [`other_sorts.py`](other_sorts.py).
+File: [`run_benchmarks.py`](run_benchmarks.py). Baselines are in [`sorts.py`](sorts.py).
 
 **Setup.**
 
@@ -252,8 +252,8 @@ a list over a linked tree of node objects for these reasons:
   missing children.
 * **Memory is compact.** A Python list is a contiguous array of references, so there is no
   per-node object or pointer overhead.
-* **The code is simpler and shared.** The sift-down loop is the same idea as heapsort's
-  `max_heapify`.
+* **The code is simpler and shared.** The bubble-down loop is the same idea as heapsort's
+  `heapify`.
 
 The one thing an array does not provide is finding an arbitrary task. That is solved with a
 position map, described in §4.3.
@@ -266,23 +266,23 @@ position map, described in §4.3.
 |---|---|
 | `task_id` | Unique ID. Used as the key in the position map. |
 | `priority` | Larger means more urgent (1–10 in the simulation). Aging may raise it. |
-| `arrival_time` | The tick at which the task becomes ready. |
-| `burst_time` | The number of CPU ticks the task needs. |
+| `arrival` | The tick at which the task becomes ready. |
+| `duration` | The number of CPU ticks the task needs. |
 | `deadline` | The tick by which it should finish, or `None` for no deadline. |
-| `name` | An optional label. |
-| `base_priority`, `remaining`, `start_time`, `finish_time` | Bookkeeping filled in by the scheduler. |
+| `label` | An optional name for printing. |
+| `original_priority`, `time_left`, `started_at`, `finished_at` | Bookkeeping filled in by the scheduler. |
 
-Derived properties are `waiting`, `turnaround`, `response` and `missed_deadline`. The class
+Derived properties are `wait_time`, `turnaround_time`, `response_time` and `is_late`. The class
 uses `eq=False` so that two tasks with equal fields are still separate objects.
 
 ### 4.3 Entries, ties and the position map
 
-* Each heap slot holds `[key, seq, task]`.
+* Each heap slot holds `[key, order, task]`.
   * `key` is a cached copy of the attribute the queue is ordered on. Comparisons therefore
     avoid a `getattr` call.
-  * `seq` is an insertion counter. Tasks with equal keys are served in FIFO order, which is
+  * `order` is an insertion counter. Tasks with equal keys are served in FIFO order, which is
     fair and makes the simulation deterministic.
-* `_pos` is a dictionary from `task_id` to the task's index in the list.
+* `where` is a dictionary from `task_id` to the task's index in the list.
   * It is updated inside `_swap`, at O(1) per swap.
   * Without it, `increase_key(task, …)` would first have to find the task with an O(n)
     linear scan. With it, the lookup is O(1) and the whole operation is O(lg n).
@@ -290,8 +290,9 @@ uses `eq=False` so that two tasks with equal fields are still separate objects.
 
 ### 4.4 Max-heap or min-heap?
 
-The class takes `order="max"` or `order="min"` and a `key` attribute name. One comparison
-helper, `_above(a, b)`, encodes the order, so the sift code is shared.
+The class `HeapPriorityQueue` takes `kind="max"` or `kind="min"` and a `key` attribute name.
+One comparison helper, `_goes_first(x, y)`, encodes the order, so the bubble-up and
+bubble-down code is shared.
 
 * **Priority scheduling uses a max-heap on `priority`.** A larger number means more urgent,
   so the most urgent task should be at the root and `extract_max` should return it. This is
@@ -299,7 +300,7 @@ helper, `_above(a, b)`, encodes the order, so the sift code is shared.
   HEAP-INCREASE-KEY).
 * **Earliest-Deadline-First uses a min-heap on `deadline`.** The smallest deadline is the
   most urgent.
-* **FCFS uses a min-heap on `arrival_time`.** It serves as the baseline.
+* **FCFS uses a min-heap on `arrival`.** It serves as the baseline.
 
 Supporting both orders let the simulation compare five policies with a single data
 structure.
@@ -313,12 +314,12 @@ path from a leaf to the root, or from the root to a leaf, has at most ⌊lg n⌋
 |---|---|---|
 | `insert(task)` | **O(lg n)** | Append to the first free leaf (amortized O(1)). Then *sift up*: while the new entry outranks its parent, swap them. One swap per level gives at most ⌊lg n⌋ swaps. |
 | `extract_max()` / `extract_min()` | **O(lg n)** | Swap the root with the last leaf and `pop()` the old root in O(1). Then *sift down* from the root: compare with both children, swap with the better one. At most ⌊lg n⌋ levels with 2 comparisons each. |
-| `increase_key(task, k)` | **O(lg n)** | Find the slot through `_pos` in O(1) and overwrite the key. In a max-heap a larger key can only break the heap property with the parent, so sift up, at most ⌊lg n⌋ swaps. In a min-heap a larger key means less urgent, so sift down. It raises `ValueError` if `k` is smaller than the current key, as in CLRS. |
+| `increase_key(task, k)` | **O(lg n)** | Find the slot through `where` in O(1) and overwrite the key. In a max-heap a larger key can only break the heap property with the parent, so sift up, at most ⌊lg n⌋ swaps. In a min-heap a larger key means less urgent, so sift down. It raises `ValueError` if `k` is smaller than the current key, as in CLRS. |
 | `decrease_key(task, k)` | **O(lg n)** | The mirror image. Sift down in a max-heap, sift up in a min-heap. |
 | `is_empty()` | **O(1)** | `not self._heap` |
 | `peek()` | **O(1)** | Returns the root `_heap[0]`. |
 | `remove(task)` | **O(lg n)** | Swap the task with the last leaf, pop it, then sift the moved entry up *or* down. Only one of the two will move it. |
-| Bulk build (`PriorityQueue(tasks=…)`) | **O(n)** | Bottom-up, the same argument as BUILD-MAX-HEAP in §2.2. |
+| Bulk build (`HeapPriorityQueue(tasks=…)`) | **O(n)** | Bottom-up, the same argument as BUILD-MAX-HEAP in §2.2. |
 | Space | **Θ(n)** | The list plus the position map. |
 
 **Correctness of key changes.** In a max-heap, take a node whose key increases. Everything
@@ -328,10 +329,10 @@ one level higher at each step, finishing at the root at the latest. Decreasing a
 symmetric: only the edges to the children can break, and sift-down repairs them. The same
 reasoning, with the order flipped, covers the min-heap.
 
-**Testing.** [`test_assignment4.py`](test_assignment4.py) has 25 unit tests. One of them runs
+**Testing.** [`test_heaps.py`](test_heaps.py) has 25 unit tests. One of them runs
 3,000 random inserts, key changes, removals and extracts. After every `extract_max` it
-checks the result against the maximum of a plain reference list. `check_invariants()`
-verifies the heap property and that every `_pos` entry agrees with the list.
+checks the result against the maximum of a plain reference list. `validate()`
+verifies the heap property and that every `where` entry agrees with the list.
 
 **Empirical check.** Part 3 of the benchmark timed each operation on queues of 2¹⁰ to 2¹⁸
 tasks, with the garbage collector paused.
@@ -367,7 +368,7 @@ File: [`scheduler.py`](scheduler.py).
 A single CPU runs in integer ticks. On each tick the scheduler does five things, each
 mapped to a priority queue operation:
 
-1. **Admit arrivals.** Each task whose `arrival_time` has been reached is added with
+1. **Admit arrivals.** Each task whose `arrival` time has been reached is added with
    `insert`.
 2. **Age waiting tasks** (aging policy only). Every 5 ticks, each waiting task gets
    `increase_key(task, priority + 1)`.
@@ -381,7 +382,7 @@ Five policies share this one loop and differ only in heap order, key, preemption
 
 | Policy | Heap | Key | Preemptive | Aging |
 |---|---|---|---|---|
-| FCFS | min | arrival_time | no | no |
+| FCFS | min | arrival | no | no |
 | Priority | max | priority | no | no |
 | Priority (preemptive) | max | priority | yes | no |
 | Priority + aging | max | priority | yes | +1 per 5 ticks waited |

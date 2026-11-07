@@ -1,29 +1,28 @@
-"""Single-CPU task scheduler simulation built on the heap priority queue.
+"""
+Simulates one CPU running tasks, using HeapPriorityQueue to choose
+what runs next.
 
-Time advances in integer ticks. At each tick the scheduler
+Time moves forward one tick at a time. Every tick:
+  1. any task that has arrived gets inserted into the queue
+  2. (aging only) every AGE_EVERY ticks, each waiting task gets +1 priority
+  3. (preemptive only) if something in the queue beats the running task,
+     the running task goes back in the queue
+  4. if the CPU is free, pull the next task off the queue
+  5. run that task for one tick
 
-  1. inserts every task whose arrival_time has been reached   (insert)
-  2. ages waiting tasks, if the policy uses aging            (increase_key)
-  3. preempts the running task if a strictly better one is
-     waiting, if the policy is preemptive                    (peek, insert)
-  4. if the CPU is free, dispatches the top task             (extract_max/min)
-  5. runs the current task for one tick
+The policies all use the same queue class. They only differ in which
+field is the key and whether it's a max-heap or min-heap:
 
-Policies compared (all use the same PriorityQueue class, only the key and
-heap order change):
+  FCFS                  min-heap on arrival, no preemption (baseline)
+  Priority              max-heap on priority, no preemption
+  Priority (preemptive) max-heap on priority, can preempt
+  Priority + aging      same as above, plus waiting tasks slowly gain
+                        priority so low-priority ones don't starve
+  EDF                   min-heap on deadline, can preempt
 
-  FCFS                   min-heap on arrival_time, non-preemptive (baseline)
-  Priority               max-heap on priority, non-preemptive
-  Priority (preemptive)  max-heap on priority, preempts on a higher arrival
-  Priority + aging       as above, but every AGING_INTERVAL ticks each waiting
-                         task's priority is raised by 1 with increase_key, so
-                         low-priority tasks cannot starve
-  EDF                    min-heap on deadline, preemptive (earliest deadline
-                         first)
-
-Run:
-    python3 scheduler.py            # demo trace + full experiment + graphs
-    python3 scheduler.py --quick    # fewer, smaller runs
+Usage:
+    python3 scheduler.py           # example + full experiment + chart
+    python3 scheduler.py --quick   # smaller version
 """
 
 import argparse
@@ -33,182 +32,195 @@ import os
 import random
 import statistics
 
-from priority_queue import PriorityQueue, Task
+from priority_queue import HeapPriorityQueue, Task
 
-AGING_INTERVAL = 5          # ticks of waiting per +1 priority
-RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
+AGE_EVERY = 5  # ticks a task has to wait to gain 1 priority
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results")
 
-POLICIES = {
-    "FCFS": dict(order="min", key="arrival_time", preemptive=False, aging=False),
-    "Priority": dict(order="max", key="priority", preemptive=False, aging=False),
-    "Priority (preemptive)": dict(order="max", key="priority", preemptive=True, aging=False),
-    "Priority + aging": dict(order="max", key="priority", preemptive=True, aging=True),
-    "EDF": dict(order="min", key="deadline", preemptive=True, aging=False),
+SCHEDULERS = {
+    "FCFS": dict(kind="min", key="arrival", preempt=False, aging=False),
+    "Priority": dict(kind="max", key="priority", preempt=False, aging=False),
+    "Priority (preemptive)": dict(kind="max", key="priority", preempt=True, aging=False),
+    "Priority + aging": dict(kind="max", key="priority", preempt=True, aging=True),
+    "EDF": dict(kind="min", key="deadline", preempt=True, aging=False),
 }
 
 
-def _beats(pq, waiting, running):
-    """True if `waiting` should preempt `running` under this queue's order."""
-    a, b = getattr(waiting, pq.key), getattr(running, pq.key)
-    return a > b if pq.order == "max" else a < b
+def should_preempt(queue, waiting, current):
+    """True if the waiting task is strictly more urgent than the current one."""
+    w = getattr(waiting, queue.key)
+    c = getattr(current, queue.key)
+    if queue.kind == "max":
+        return w > c
+    return w < c
 
 
-def simulate(tasks, policy, aging_interval=AGING_INTERVAL):
-    """Run one policy over a workload. Returns (finished tasks, stats dict).
+def run_simulation(task_list, policy, age_every=AGE_EVERY):
+    """Run one policy on a list of tasks.
 
-    `tasks` is not modified: the simulation works on deep copies.
+    Works on copies, so the tasks passed in aren't changed.
+    Returns (finished tasks, dict of extra info).
     """
-    cfg = POLICIES[policy]
-    pending = sorted(copy.deepcopy(tasks), key=lambda t: (t.arrival_time, t.task_id))
-    pq = PriorityQueue(order=cfg["order"], key=cfg["key"])
-    n = len(pending)
-    nxt = 0                 # index of the next task yet to arrive
-    time = 0
-    running = None
-    finished = []
-    timeline = []           # task_id (or None for idle) per tick
-    preemptions = 0
-    pq_ops = 0
+    setup = SCHEDULERS[policy]
+    upcoming = sorted(copy.deepcopy(task_list), key=lambda t: (t.arrival, t.task_id))
+    queue = HeapPriorityQueue(kind=setup["kind"], key=setup["key"])
 
-    while len(finished) < n:
-        # 1. admit arrivals
-        while nxt < n and pending[nxt].arrival_time <= time:
-            pq.insert(pending[nxt])
-            pq_ops += 1
-            nxt += 1
+    total = len(upcoming)
+    next_up = 0       # index of the next task that hasn't arrived yet
+    clock = 0
+    current = None    # task on the CPU right now
+    done = []
+    history = []      # which task ran on each tick (None = idle)
+    preempt_count = 0
+    queue_ops = 0
 
-        # 2. aging: every waiting task gains +1 priority per interval
-        if cfg["aging"] and time > 0 and time % aging_interval == 0:
-            for task in pq.tasks():
-                pq.increase_key(task, task.priority + 1)
-                pq_ops += 1
+    while len(done) < total:
+        # new arrivals
+        while next_up < total and upcoming[next_up].arrival <= clock:
+            queue.insert(upcoming[next_up])
+            queue_ops += 1
+            next_up += 1
 
-        # 3. preemption
-        if (running is not None and cfg["preemptive"] and not pq.is_empty()
-                and _beats(pq, pq.peek(), running)):
-            pq.insert(running)
-            pq_ops += 1
-            running = None
-            preemptions += 1
+        # aging: bump everyone who's waiting
+        if setup["aging"] and clock > 0 and clock % age_every == 0:
+            for t in queue.all_tasks():
+                queue.increase_key(t, t.priority + 1)
+                queue_ops += 1
 
-        # 4. dispatch
-        if running is None and not pq.is_empty():
-            running = pq.extract()
-            pq_ops += 1
-            if running.start_time is None:
-                running.start_time = time
+        # kick the current task off if something better is waiting
+        if (current is not None and setup["preempt"] and not queue.is_empty()
+                and should_preempt(queue, queue.peek(), current)):
+            queue.insert(current)
+            queue_ops += 1
+            current = None
+            preempt_count += 1
 
-        # 5. execute one tick, or jump over idle time
-        if running is None:
-            gap = pending[nxt].arrival_time - time
-            timeline.extend([None] * gap)
-            time += gap
+        # CPU free? grab the next task
+        if current is None and not queue.is_empty():
+            current = queue.extract()
+            queue_ops += 1
+            if current.started_at is None:
+                current.started_at = clock
+
+        # nothing to run, skip ahead to the next arrival
+        if current is None:
+            idle = upcoming[next_up].arrival - clock
+            history.extend([None] * idle)
+            clock += idle
             continue
-        running.remaining -= 1
-        timeline.append(running.task_id)
-        time += 1
-        if running.remaining == 0:
-            running.finish_time = time
-            finished.append(running)
-            running = None
 
-    return finished, {"preemptions": preemptions, "makespan": time,
-                      "pq_ops": pq_ops, "timeline": timeline}
+        current.time_left -= 1
+        history.append(current.task_id)
+        clock += 1
+        if current.time_left == 0:
+            current.finished_at = clock
+            done.append(current)
+            current = None
+
+    info = {"preemptions": preempt_count, "makespan": clock,
+            "pq_ops": queue_ops, "timeline": history}
+    return done, info
 
 
-def summarize(finished, extra):
-    """Aggregate per-task metrics for one simulation run."""
-    def band(lo, hi):
-        waits = [t.waiting for t in finished if lo <= t.base_priority <= hi]
+def collect_stats(done, info):
+    """Turn the finished tasks from one run into summary numbers."""
+    def avg_wait_for(lo, hi):
+        waits = [t.wait_time for t in done if lo <= t.original_priority <= hi]
         return statistics.mean(waits) if waits else 0.0
 
-    waits = sorted(t.waiting for t in finished)
-    with_deadline = [t for t in finished if t.deadline is not None]
+    waits = sorted(t.wait_time for t in done)
+    has_deadline = [t for t in done if t.deadline is not None]
+    late = sum(t.is_late for t in has_deadline)
     return {
         "avg_wait": statistics.mean(waits),
         "p95_wait": waits[int(0.95 * (len(waits) - 1))],
         "max_wait": waits[-1],
-        "avg_turnaround": statistics.mean(t.turnaround for t in finished),
-        "avg_response": statistics.mean(t.response for t in finished),
-        "wait_low": band(1, 3),
-        "wait_mid": band(4, 7),
-        "wait_high": band(8, 10),
-        "deadline_miss_pct": 100 * sum(t.missed_deadline for t in with_deadline)
-                             / max(1, len(with_deadline)),
-        "preemptions": extra["preemptions"],
-        "pq_ops": extra["pq_ops"],
+        "avg_turnaround": statistics.mean(t.turnaround_time for t in done),
+        "avg_response": statistics.mean(t.response_time for t in done),
+        "wait_low": avg_wait_for(1, 3),
+        "wait_mid": avg_wait_for(4, 7),
+        "wait_high": avg_wait_for(8, 10),
+        "deadline_miss_pct": 100 * late / max(1, len(has_deadline)),
+        "preemptions": info["preemptions"],
+        "pq_ops": info["pq_ops"],
     }
 
 
-def generate_workload(n, load, seed):
-    """Random tasks: Poisson arrivals, burst 1-10, priority 1-10.
+def make_tasks(how_many, load, seed):
+    """Random tasks for the experiment.
 
-    `load` is the offered CPU utilisation (mean burst / mean inter-arrival).
-    Each deadline gives the task 2x to 6x its burst time of slack.
+    Arrivals are Poisson, durations are 1-10 ticks, priorities are 1-10.
+    `load` is roughly how busy the CPU is (average duration divided by
+    average gap between arrivals). Each deadline gives the task between 2x
+    and 6x its duration of slack.
     """
-    rng = random.Random(seed)
-    mean_burst = 5.5
-    rate = load / mean_burst
-    t = 0.0
+    rand = random.Random(seed)
+    avg_duration = 5.5
+    arrival_rate = load / avg_duration
+    clock = 0.0
     tasks = []
-    for i in range(n):
-        t += rng.expovariate(rate)
-        arrival = int(t)
-        burst = rng.randint(1, 10)
-        tasks.append(Task(task_id=i, priority=rng.randint(1, 10), arrival_time=arrival,
-                          burst_time=burst,
-                          deadline=arrival + round(burst * rng.uniform(2, 6))))
+    for i in range(how_many):
+        clock += rand.expovariate(arrival_rate)
+        arrives = int(clock)
+        dur = rand.randint(1, 10)
+        tasks.append(Task(task_id=i, priority=rand.randint(1, 10), arrival=arrives,
+                          duration=dur,
+                          deadline=arrives + round(dur * rand.uniform(2, 6))))
     return tasks
 
 
-def demo():
-    """Small hand-made workload, printed as a per-tick timeline."""
+def small_example():
+    """Six tasks by hand, printed as a timeline so you can see each policy."""
     tasks = [
-        Task(1, priority=2, arrival_time=0, burst_time=6, deadline=20, name="A"),
-        Task(2, priority=5, arrival_time=1, burst_time=3, deadline=8, name="B"),
-        Task(3, priority=9, arrival_time=2, burst_time=2, deadline=6, name="C"),
-        Task(4, priority=5, arrival_time=3, burst_time=4, deadline=18, name="D"),
-        Task(5, priority=1, arrival_time=4, burst_time=2, deadline=9, name="E"),
-        Task(6, priority=8, arrival_time=6, burst_time=3, deadline=12, name="F"),
+        Task(1, priority=2, arrival=0, duration=6, deadline=20, label="A"),
+        Task(2, priority=5, arrival=1, duration=3, deadline=8, label="B"),
+        Task(3, priority=9, arrival=2, duration=2, deadline=6, label="C"),
+        Task(4, priority=5, arrival=3, duration=4, deadline=18, label="D"),
+        Task(5, priority=1, arrival=4, duration=2, deadline=9, label="E"),
+        Task(6, priority=8, arrival=6, duration=3, deadline=12, label="F"),
     ]
-    names = {t.task_id: t.name for t in tasks}
+    names = {t.task_id: t.label for t in tasks}
+
     print("Demo workload")
     print("  task  prio  arrival  burst  deadline")
     for t in tasks:
-        print(f"  {t.name:>4}  {t.priority:>4}  {t.arrival_time:>7}  {t.burst_time:>5}  {t.deadline:>8}")
+        print(f"  {t.label:>4}  {t.priority:>4}  {t.arrival:>7}  {t.duration:>5}  {t.deadline:>8}")
     print("\n  Timeline (one letter per tick)")
     print("  " + " " * 23 + "".join(str(i % 10) for i in range(20)))
-    for policy in POLICIES:
-        finished, extra = simulate(tasks, policy, aging_interval=3)
-        line = "".join(names[x] if x else "." for x in extra["timeline"])
-        s = summarize(finished, extra)
-        missed = [t.name for t in sorted(finished, key=lambda t: t.task_id) if t.missed_deadline]
-        print(f"  {policy:<22} {line:<20}  avg wait {s['avg_wait']:4.1f}  "
-              f"missed: {','.join(missed) or '-'}")
+
+    for policy in SCHEDULERS:
+        done, info = run_simulation(tasks, policy, age_every=3)
+        line = "".join(names[x] if x else "." for x in info["timeline"])
+        stats = collect_stats(done, info)
+        late = [t.label for t in sorted(done, key=lambda t: t.task_id) if t.is_late]
+        print(f"  {policy:<22} {line:<20}  avg wait {stats['avg_wait']:4.1f}  "
+              f"missed: {','.join(late) or '-'}")
     print("  (aging interval 3 ticks in the demo)\n")
 
 
-METRICS = ["avg_wait", "p95_wait", "max_wait", "avg_turnaround", "avg_response",
+COLUMNS = ["avg_wait", "p95_wait", "max_wait", "avg_turnaround", "avg_response",
            "wait_low", "wait_mid", "wait_high", "deadline_miss_pct", "preemptions", "pq_ops"]
 
 
-def experiment(n, loads, seeds):
+def run_experiment(how_many, loads, seeds):
     rows = []
     for load in loads:
-        for policy in POLICIES:
-            runs = [summarize(*simulate(generate_workload(n, load, seed), policy))
-                    for seed in seeds]
+        for policy in SCHEDULERS:
+            runs = []
+            for seed in seeds:
+                tasks = make_tasks(how_many, load, seed)
+                runs.append(collect_stats(*run_simulation(tasks, policy)))
             row = {"load": load, "policy": policy}
-            row.update({m: statistics.mean(r[m] for r in runs) for m in METRICS})
+            for col in COLUMNS:
+                row[col] = statistics.mean(r[col] for r in runs)
             rows.append(row)
     return rows
 
 
-def print_table(rows, load):
+def print_results(rows, load):
     print(f"Load {load:.2f}: mean over seeds")
-    hdr = (f"  {'policy':<22}{'avg wait':>9}{'p95':>7}{'max':>7}{'turn':>7}"
-           f"{'low':>8}{'mid':>7}{'high':>7}{'miss %':>8}{'preempt':>9}")
-    print(hdr)
+    print(f"  {'policy':<22}{'avg wait':>9}{'p95':>7}{'max':>7}{'turn':>7}"
+          f"{'low':>8}{'mid':>7}{'high':>7}{'miss %':>8}{'preempt':>9}")
     for r in rows:
         if r["load"] != load:
             continue
@@ -218,42 +230,42 @@ def print_table(rows, load):
     print("  (low/mid/high = average wait for base priority 1-3 / 4-7 / 8-10)\n")
 
 
-def plot(rows, loads, focus_load, path):
+def draw_chart(rows, loads, chart_load, path):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    import plot_style
-    plot_style.apply(plt)
+    import chart_style
+    chart_style.setup(plt)
 
-    policies = list(POLICIES)
-    colors = {p: plot_style.SERIES[i] for i, p in enumerate(policies)}
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.6))
+    names = list(SCHEDULERS)
+    color_of = {name: chart_style.COLORS[i] for i, name in enumerate(names)}
+    fig, (left, right) = plt.subplots(1, 2, figsize=(12, 4.6))
 
-    # (a) waiting time by priority band at the focus load
-    bands = [("wait_low", "Low (1-3)"), ("wait_mid", "Mid (4-7)"), ("wait_high", "High (8-10)")]
-    width = 0.16
-    for i, p in enumerate(policies):
-        r = next(r for r in rows if r["load"] == focus_load and r["policy"] == p)
-        xs = [b + (i - 2) * (width + 0.01) for b in range(len(bands))]
-        ax1.bar(xs, [r[k] for k, _ in bands], width, color=colors[p], label=p)
-    ax1.set_xticks(range(len(bands)))
-    ax1.set_xticklabels([lbl for _, lbl in bands])
-    ax1.set_xlabel("Task base priority")
-    ax1.set_ylabel("Average waiting time (ticks)")
-    ax1.set_title(f"Waiting time by priority, load {focus_load}")
-    ax1.grid(axis="x", visible=False)
-    ax1.legend(loc="upper right")
+    # left: average wait split by priority group
+    groups = [("wait_low", "Low (1-3)"), ("wait_mid", "Mid (4-7)"), ("wait_high", "High (8-10)")]
+    bar_w = 0.16
+    for i, name in enumerate(names):
+        row = next(r for r in rows if r["load"] == chart_load and r["policy"] == name)
+        xs = [g + (i - 2) * (bar_w + 0.01) for g in range(len(groups))]
+        left.bar(xs, [row[col] for col, _ in groups], bar_w, color=color_of[name], label=name)
+    left.set_xticks(range(len(groups)))
+    left.set_xticklabels([label for _, label in groups])
+    left.set_xlabel("Task base priority")
+    left.set_ylabel("Average waiting time (ticks)")
+    left.set_title(f"Waiting time by priority, load {chart_load}")
+    left.grid(axis="x", visible=False)
+    left.legend(loc="upper right")
 
-    # (b) deadline misses vs load
-    for i, p in enumerate(policies):
-        ys = [next(r for r in rows if r["load"] == L and r["policy"] == p)["deadline_miss_pct"]
+    # right: % of deadlines missed as load goes up
+    for i, name in enumerate(names):
+        ys = [next(r for r in rows if r["load"] == L and r["policy"] == name)["deadline_miss_pct"]
               for L in loads]
-        ax2.plot(loads, ys, color=colors[p], marker=plot_style.MARKERS[i], label=p)
-    ax2.set_xlabel("Offered load (CPU utilisation)")
-    ax2.set_ylabel("Tasks missing their deadline (%)")
-    ax2.set_title("Deadline misses vs load")
-    ax2.set_xticks(loads)
-    ax2.legend(loc="upper left")
+        right.plot(loads, ys, color=color_of[name], marker=chart_style.MARKERS[i], label=name)
+    right.set_xlabel("Offered load (CPU utilisation)")
+    right.set_ylabel("Tasks missing their deadline (%)")
+    right.set_title("Deadline misses vs load")
+    right.set_xticks(loads)
+    right.legend(loc="upper left")
 
     fig.tight_layout()
     fig.savefig(path, dpi=150)
@@ -261,32 +273,38 @@ def plot(rows, loads, focus_load, path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description="CPU scheduler simulation")
     parser.add_argument("--quick", action="store_true", help="smaller, faster run")
     args = parser.parse_args()
 
-    demo()
-    n, seeds = (300, range(2)) if args.quick else (2000, range(5))
-    loads = [0.5, 0.7, 0.85, 0.95]
-    focus = 0.85
-    print(f"Experiment: {n} tasks per run, {len(seeds)} seeds, loads {loads}\n")
-    rows = experiment(n, loads, seeds)
-    for load in loads:
-        print_table(rows, load)
+    small_example()
 
-    os.makedirs(RESULTS_DIR, exist_ok=True)
-    csv_path = os.path.join(RESULTS_DIR, "scheduler_results.csv")
-    with open(csv_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["load", "policy"] + METRICS)
-        w.writeheader()
+    if args.quick:
+        how_many, seeds = 300, range(2)
+    else:
+        how_many, seeds = 2000, range(5)
+    loads = [0.5, 0.7, 0.85, 0.95]
+    chart_load = 0.85
+
+    print(f"Experiment: {how_many} tasks per run, {len(seeds)} seeds, loads {loads}\n")
+    rows = run_experiment(how_many, loads, seeds)
+    for load in loads:
+        print_results(rows, load)
+
+    os.makedirs(OUT_DIR, exist_ok=True)
+    csv_file = os.path.join(OUT_DIR, "scheduler_results.csv")
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["load", "policy"] + COLUMNS)
+        writer.writeheader()
         for r in rows:
-            w.writerow({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
-    png_path = os.path.join(RESULTS_DIR, "scheduler.png")
+            writer.writerow({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()})
+
+    png_file = os.path.join(OUT_DIR, "scheduler.png")
     try:
-        plot(rows, loads, focus, png_path)
-        print(f"Wrote {csv_path}\nWrote {png_path}")
+        draw_chart(rows, loads, chart_load, png_file)
+        print(f"Wrote {csv_file}\nWrote {png_file}")
     except ImportError:
-        print(f"Wrote {csv_path} (install matplotlib for the graph)")
+        print(f"Wrote {csv_file} (install matplotlib if you want the chart)")
 
 
 if __name__ == "__main__":

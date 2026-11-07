@@ -1,325 +1,297 @@
-"""Array-backed binary-heap priority queue of Task objects.
+"""
+Priority queue for Task objects, built on a binary heap stored in a list.
 
-Design
-------
-* Storage: one Python list used as an implicit complete binary tree
-  (CLRS Chapter 6, 0-based): parent(i) = (i-1)//2, children 2i+1, 2i+2.
-  A list gives O(1) index arithmetic, contiguous storage, amortized O(1)
-  append/pop at the end (exactly where a heap grows and shrinks) and no
-  per-node pointers. A linked tree would need parent pointers and a way to
-  find the "last" node, for no asymptotic gain.
+Why a list: a complete binary tree fits in an array with no gaps, so we
+can find a parent or child with plain index math (same formulas as
+heapsort.py). New items get appended and removed items get popped from
+the end, and both of those are O(1) on a Python list. A linked tree would
+need parent pointers and extra work to find the last node, and it
+wouldn't be any faster.
 
-* Entries: each slot holds a small list [key, seq, task]. `key` is a cached
-  copy of the task attribute the queue is ordered on (priority, deadline or
-  arrival time). `seq` is an insertion counter used to break ties in FIFO
-  order, so equal-priority tasks are served in the order they were queued
-  and the scheduler's results are deterministic.
+Each slot in the list is a small list: [key, order, task]
+  key   - the value we sort on (priority, deadline or arrival time),
+          copied out of the task so we don't call getattr on every compare
+  order - a counter that goes up on every insert. If two keys tie, the
+          one inserted first wins, so equal-priority tasks come out FIFO.
+  task  - the Task itself
 
-* Position map: `_pos[task_id] -> index in the list`. It is updated on
-  every swap, which costs O(1), and lets increase_key / decrease_key /
-  remove find a task in O(1) instead of an O(n) scan. Without it, changing
-  a key would be O(n); with it, O(lg n).
+We also keep `where`, a dict of task_id -> list index. It gets updated on
+every swap. That way increase_key / decrease_key can find a task right
+away instead of scanning the whole list, so they stay O(log n).
 
-* Order: `order="max"` serves the largest key first (a max-priority queue,
-  used for priority scheduling, where 10 is most urgent); `order="min"`
-  serves the smallest first (used for earliest-deadline-first and for FCFS
-  by arrival time). The same code handles both through `_above()`.
-
-Complexities (n = number of queued tasks)
------------------------------------------
-    insert            O(lg n)   append, then sift up at most height levels
-    peek              O(1)      the root
-    extract_max/min   O(lg n)   move last leaf to root, sift down
-    increase_key      O(lg n)   O(1) lookup + sift up (max) / down (min)
-    decrease_key      O(lg n)   O(1) lookup + sift down (max) / up (min)
-    remove            O(lg n)   swap with last, pop, sift either way
-    is_empty, len     O(1)
-    build (heapify)   O(n)      bottom-up, as in BUILD-MAX-HEAP
-Space: Theta(n) for the list plus Theta(n) for the position map.
+Running times (n = tasks in the queue):
+  insert                    O(log n)
+  extract_max / extract_min O(log n)
+  increase_key/decrease_key O(log n)
+  remove                    O(log n)
+  peek, is_empty, len       O(1)
+  building from a list      O(n)
 """
 
-import itertools
 from dataclasses import dataclass, field
+from itertools import count
 from typing import Optional
 
 
 @dataclass(eq=False)
 class Task:
-    """One schedulable unit of work.
+    """A job for the scheduler.
 
-    task_id       unique identifier (used as the position-map key)
-    priority      larger = more urgent (1..10 in the simulation); may be
-                  raised over time by aging
-    arrival_time  tick at which the task becomes ready
-    burst_time    CPU ticks the task needs
-    deadline      tick by which it should finish (None = no deadline)
-    name          optional label for printing
-
-    The scheduler fills in the bookkeeping fields below.
+    Higher priority = more urgent (the simulation uses 1 to 10).
+    deadline can be None if the task doesn't have one.
+    The fields after `label` get filled in while the simulation runs.
     """
 
     task_id: int
     priority: int
-    arrival_time: int = 0
-    burst_time: int = 1
+    arrival: int = 0
+    duration: int = 1
     deadline: Optional[int] = None
-    name: str = ""
+    label: str = ""
 
-    base_priority: int = field(init=False)
-    remaining: int = field(init=False)
-    start_time: Optional[int] = field(default=None, init=False)
-    finish_time: Optional[int] = field(default=None, init=False)
+    original_priority: int = field(init=False)
+    time_left: int = field(init=False)
+    started_at: Optional[int] = field(default=None, init=False)
+    finished_at: Optional[int] = field(default=None, init=False)
 
     def __post_init__(self):
-        self.base_priority = self.priority
-        self.remaining = self.burst_time
+        # remember the starting priority, since aging can bump it later
+        self.original_priority = self.priority
+        self.time_left = self.duration
 
-    # Derived metrics, valid once the task has finished.
+    # these only make sense once the task is done
     @property
-    def turnaround(self):
-        return self.finish_time - self.arrival_time
-
-    @property
-    def waiting(self):
-        return self.turnaround - self.burst_time
+    def turnaround_time(self):
+        return self.finished_at - self.arrival
 
     @property
-    def response(self):
-        return self.start_time - self.arrival_time
+    def wait_time(self):
+        return self.turnaround_time - self.duration
 
     @property
-    def missed_deadline(self):
-        return self.deadline is not None and self.finish_time > self.deadline
+    def response_time(self):
+        return self.started_at - self.arrival
+
+    @property
+    def is_late(self):
+        return self.deadline is not None and self.finished_at > self.deadline
 
     def __repr__(self):
-        label = self.name or f"T{self.task_id}"
-        return (f"Task({label}, prio={self.priority}, arr={self.arrival_time}, "
-                f"burst={self.burst_time}, dl={self.deadline})")
+        name = self.label or f"T{self.task_id}"
+        return (f"Task({name}, prio={self.priority}, arrival={self.arrival}, "
+                f"duration={self.duration}, deadline={self.deadline})")
 
 
-class PriorityQueue:
-    """Binary-heap priority queue of Task objects keyed on one attribute.
+class HeapPriorityQueue:
+    """Binary heap of Tasks.
 
-    PriorityQueue()                               max-heap on task.priority
-    PriorityQueue(order="min", key="deadline")    min-heap on task.deadline
+    HeapPriorityQueue()                             -> max-heap on priority
+    HeapPriorityQueue(kind="min", key="deadline")   -> min-heap on deadline
     """
 
-    def __init__(self, order="max", key="priority", tasks=()):
-        if order not in ("max", "min"):
-            raise ValueError("order must be 'max' or 'min'")
-        self.order = order
+    def __init__(self, kind="max", key="priority", tasks=()):
+        if kind not in ("max", "min"):
+            raise ValueError("kind has to be 'max' or 'min'")
+        self.kind = kind
         self.key = key
-        self._heap = []
-        self._pos = {}
-        self._counter = itertools.count()
+        self.items = []
+        self.where = {}
+        self._ticket = count()
         if tasks:
-            self._build(tasks)
+            self._load_all(tasks)
 
-    # ----------------------------------------------------------- basics
     def __len__(self):
-        return len(self._heap)
-
-    def is_empty(self):
-        """True if no tasks are queued. O(1)."""
-        return not self._heap
+        return len(self.items)
 
     def __contains__(self, task):
-        return task.task_id in self._pos
+        return task.task_id in self.where
+
+    def is_empty(self):
+        return len(self.items) == 0
 
     def peek(self):
-        """Return the highest-priority task without removing it. O(1)."""
-        if not self._heap:
-            raise IndexError("peek from an empty priority queue")
-        return self._heap[0][2]
+        """Look at the top task without taking it out."""
+        if not self.items:
+            raise IndexError("queue is empty")
+        return self.items[0][2]
 
-    def key_of(self, task):
-        return self._heap[self._pos[task.task_id]][0]
+    def get_key(self, task):
+        return self.items[self.where[task.task_id]][0]
 
-    # ------------------------------------------------- heap primitives
-    def _above(self, a, b):
-        """True if entry a belongs closer to the root than entry b."""
-        if a[0] != b[0]:
-            return a[0] > b[0] if self.order == "max" else a[0] < b[0]
-        return a[1] < b[1]                  # FIFO among equal keys
+    # ---- helpers that keep the heap in order ----
+
+    def _goes_first(self, x, y):
+        """Should entry x sit above entry y in the heap?"""
+        if x[0] != y[0]:
+            if self.kind == "max":
+                return x[0] > y[0]
+            return x[0] < y[0]
+        return x[1] < y[1]  # tie on key -> whoever was inserted first
 
     def _swap(self, i, j):
-        h = self._heap
-        h[i], h[j] = h[j], h[i]
-        self._pos[h[i][2].task_id] = i
-        self._pos[h[j][2].task_id] = j
+        items = self.items
+        items[i], items[j] = items[j], items[i]
+        self.where[items[i][2].task_id] = i
+        self.where[items[j][2].task_id] = j
 
-    def _sift_up(self, i):
-        """Move entry i toward the root while it beats its parent. O(lg n)."""
-        h = self._heap
+    def _bubble_up(self, i):
         while i > 0:
-            parent = (i - 1) // 2
-            if not self._above(h[i], h[parent]):
+            up = (i - 1) // 2
+            if not self._goes_first(self.items[i], self.items[up]):
                 break
-            self._swap(i, parent)
-            i = parent
+            self._swap(i, up)
+            i = up
 
-    def _sift_down(self, i):
-        """MAX-HEAPIFY generalised to either order. O(lg n)."""
-        h = self._heap
-        n = len(h)
+    def _bubble_down(self, i):
+        size = len(self.items)
         while True:
-            left = 2 * i + 1
-            right = left + 1
+            l = 2 * i + 1
+            r = l + 1
             best = i
-            if left < n and self._above(h[left], h[best]):
-                best = left
-            if right < n and self._above(h[right], h[best]):
-                best = right
+            if l < size and self._goes_first(self.items[l], self.items[best]):
+                best = l
+            if r < size and self._goes_first(self.items[r], self.items[best]):
+                best = r
             if best == i:
                 return
             self._swap(i, best)
             i = best
 
-    def _build(self, tasks):
-        """Load many tasks at once in O(n), bottom-up like BUILD-MAX-HEAP."""
-        for task in tasks:
-            if task.task_id in self._pos:
-                raise ValueError(f"task {task.task_id} is already queued")
-            self._pos[task.task_id] = len(self._heap)
-            self._heap.append([getattr(task, self.key), next(self._counter), task])
-        for i in range(len(self._heap) // 2 - 1, -1, -1):
-            self._sift_down(i)
+    def _load_all(self, tasks):
+        """Put a batch of tasks in and heapify once at the end. O(n)."""
+        for t in tasks:
+            if t.task_id in self.where:
+                raise ValueError(f"task {t.task_id} is already in the queue")
+            self.where[t.task_id] = len(self.items)
+            self.items.append([getattr(t, self.key), next(self._ticket), t])
+        for i in range(len(self.items) // 2 - 1, -1, -1):
+            self._bubble_down(i)
 
-    # ------------------------------------------------- core operations
+    # ---- the main operations ----
+
     def insert(self, task):
-        """Add a task, keyed on its current `self.key` attribute. O(lg n).
+        """Add a task. O(log n).
 
-        The new entry goes in the first free leaf (end of the list), which
-        keeps the tree complete, and then sifts up past any parent it
-        outranks. The path from a leaf to the root has floor(lg n) edges,
-        so there are at most that many swaps.
+        Put it at the end of the list (the next open leaf) and let it bubble
+        up while it beats its parent. The tree is about log n levels tall,
+        so that's the most swaps it can take.
         """
-        if task.task_id in self._pos:
-            raise ValueError(f"task {task.task_id} is already queued")
-        self._heap.append([getattr(task, self.key), next(self._counter), task])
-        self._pos[task.task_id] = len(self._heap) - 1
-        self._sift_up(len(self._heap) - 1)
+        if task.task_id in self.where:
+            raise ValueError(f"task {task.task_id} is already in the queue")
+        self.items.append([getattr(task, self.key), next(self._ticket), task])
+        self.where[task.task_id] = len(self.items) - 1
+        self._bubble_up(len(self.items) - 1)
 
     def extract(self):
-        """Remove and return the top task (max or min, by `order`). O(lg n).
+        """Take out the top task (max or min depending on kind). O(log n).
 
-        The root is swapped with the last leaf, the old root is popped off
-        the end in O(1), and the leaf now at the root sifts down. Sift-down
-        does two comparisons per level over at most floor(lg n) levels.
+        Swap the root with the last item, pop it off the end, then bubble
+        the new root down to where it belongs.
         """
-        if not self._heap:
-            raise IndexError("extract from an empty priority queue")
-        self._swap(0, len(self._heap) - 1)
-        _, _, task = self._heap.pop()
-        del self._pos[task.task_id]
-        if self._heap:
-            self._sift_down(0)
-        return task
+        if not self.items:
+            raise IndexError("queue is empty")
+        self._swap(0, len(self.items) - 1)
+        top = self.items.pop()[2]
+        del self.where[top.task_id]
+        if self.items:
+            self._bubble_down(0)
+        return top
 
     def extract_max(self):
-        """HEAP-EXTRACT-MAX. Only valid on a max-heap."""
-        if self.order != "max":
-            raise TypeError("extract_max called on a min-heap; use extract_min")
+        if self.kind != "max":
+            raise TypeError("this is a min-heap, use extract_min()")
         return self.extract()
 
     def extract_min(self):
-        """HEAP-EXTRACT-MIN. Only valid on a min-heap."""
-        if self.order != "min":
-            raise TypeError("extract_min called on a max-heap; use extract_max")
+        if self.kind != "min":
+            raise TypeError("this is a max-heap, use extract_max()")
         return self.extract()
 
-    def _set_key(self, task, new_key):
-        i = self._pos.get(task.task_id)
-        if i is None:
-            raise KeyError(f"task {task.task_id} is not in the queue")
-        old_key = self._heap[i][0]
-        self._heap[i][0] = new_key
-        setattr(task, self.key, new_key)    # keep the Task in sync
-        return i, old_key
+    def _update_key(self, task, new_key):
+        spot = self.where.get(task.task_id)
+        if spot is None:
+            raise KeyError(f"task {task.task_id} isn't in the queue")
+        self.items[spot][0] = new_key
+        setattr(task, self.key, new_key)  # keep the Task object in sync too
+        return spot
 
     def increase_key(self, task, new_key):
-        """Raise a queued task's key to `new_key`. O(lg n).
+        """Raise a task's key. O(log n).
 
-        Max-heap: the task can only move up (it now beats more nodes), so
-        sift up -- this is CLRS's HEAP-INCREASE-KEY. Min-heap: a larger key
-        means *less* urgent, so sift down. Either way: O(1) lookup through
-        the position map, then at most floor(lg n) swaps.
+        Finding the task is O(1) thanks to `where`. In a max-heap a bigger
+        key can only move it up, so bubble up. In a min-heap bigger means
+        less urgent, so it bubbles down instead.
         """
-        i = self._pos.get(task.task_id)
-        if i is not None and new_key < self._heap[i][0]:
-            raise ValueError("new key is smaller than the current key")
-        i, _ = self._set_key(task, new_key)
-        if self.order == "max":
-            self._sift_up(i)
+        spot = self.where.get(task.task_id)
+        if spot is not None and new_key < self.items[spot][0]:
+            raise ValueError("new key is smaller than the old one")
+        spot = self._update_key(task, new_key)
+        if self.kind == "max":
+            self._bubble_up(spot)
         else:
-            self._sift_down(i)
+            self._bubble_down(spot)
 
     def decrease_key(self, task, new_key):
-        """Lower a queued task's key to `new_key`. O(lg n).
-
-        Mirror image of increase_key: sift down in a max-heap, up in a
-        min-heap (CLRS's MIN-HEAP-DECREASE-KEY).
-        """
-        i = self._pos.get(task.task_id)
-        if i is not None and self._heap[i][0] < new_key:
-            raise ValueError("new key is larger than the current key")
-        i, _ = self._set_key(task, new_key)
-        if self.order == "max":
-            self._sift_down(i)
+        """Lower a task's key. O(log n). Opposite of increase_key."""
+        spot = self.where.get(task.task_id)
+        if spot is not None and self.items[spot][0] < new_key:
+            raise ValueError("new key is bigger than the old one")
+        spot = self._update_key(task, new_key)
+        if self.kind == "max":
+            self._bubble_down(spot)
         else:
-            self._sift_up(i)
+            self._bubble_up(spot)
 
     def change_key(self, task, new_key):
-        """Set a task's key in either direction. O(lg n)."""
-        if new_key < self.key_of(task):
+        """Set the key either way, picks increase or decrease for you."""
+        if new_key < self.get_key(task):
             self.decrease_key(task, new_key)
         else:
             self.increase_key(task, new_key)
 
     def remove(self, task):
-        """Delete an arbitrary queued task (e.g. a cancelled job). O(lg n)."""
-        i = self._pos.get(task.task_id)
-        if i is None:
-            raise KeyError(f"task {task.task_id} is not in the queue")
-        last = len(self._heap) - 1
-        self._swap(i, last)
-        self._heap.pop()
-        del self._pos[task.task_id]
-        if i < len(self._heap):
-            self._sift_up(i)
-            self._sift_down(i)
+        """Pull out any task, not just the top one (e.g. if it got cancelled)."""
+        spot = self.where.get(task.task_id)
+        if spot is None:
+            raise KeyError(f"task {task.task_id} isn't in the queue")
+        self._swap(spot, len(self.items) - 1)
+        self.items.pop()
+        del self.where[task.task_id]
+        if spot < len(self.items):
+            # the item we moved in could need to go either way
+            self._bubble_up(spot)
+            self._bubble_down(spot)
         return task
 
-    def tasks(self):
-        """The queued tasks in heap (array) order -- not sorted."""
-        return [entry[2] for entry in self._heap]
+    def all_tasks(self):
+        """Tasks in the order they sit in the list (not sorted)."""
+        return [entry[2] for entry in self.items]
 
-    def check_invariants(self):
-        """Assert the heap property and position map are consistent. O(n).
-
-        Used by the tests; not called in normal operation.
-        """
-        h = self._heap
-        assert len(self._pos) == len(h)
-        for i, entry in enumerate(h):
-            assert self._pos[entry[2].task_id] == i
+    def validate(self):
+        """Check the heap rule and the `where` dict. Only used in tests."""
+        assert len(self.where) == len(self.items)
+        for i, entry in enumerate(self.items):
+            assert self.where[entry[2].task_id] == i
             assert entry[0] == getattr(entry[2], self.key)
             if i > 0:
-                assert not self._above(entry, h[(i - 1) // 2]), f"heap violated at {i}"
+                parent = self.items[(i - 1) // 2]
+                assert not self._goes_first(entry, parent), f"heap broken at {i}"
 
 
 if __name__ == "__main__":
-    pq = PriorityQueue()
-    jobs = [Task(1, 3, name="backup"), Task(2, 9, name="page-fault"),
-            Task(3, 5, name="compile"), Task(4, 1, name="log-rotate")]
+    pq = HeapPriorityQueue()
+    jobs = [Task(1, 3, label="backup"), Task(2, 9, label="page-fault"),
+            Task(3, 5, label="compile"), Task(4, 1, label="log-rotate")]
     for job in jobs:
         pq.insert(job)
-    print("queued   :", [t.name for t in pq.tasks()], "(heap order)")
+    print("in queue:", [t.label for t in pq.all_tasks()], "(list order)")
+
     pq.increase_key(jobs[3], 10)
-    print("log-rotate raised to 10; next up:", pq.peek().name)
+    print("bumped log-rotate to 10, top is now:", pq.peek().label)
     pq.decrease_key(jobs[1], 2)
-    print("page-fault lowered to 2")
-    order = []
+    print("dropped page-fault to 2")
+
+    done = []
     while not pq.is_empty():
-        order.append(pq.extract_max().name)
-    print("served   :", order)
+        done.append(pq.extract_max().label)
+    print("run order:", done)

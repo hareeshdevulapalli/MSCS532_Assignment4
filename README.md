@@ -14,13 +14,13 @@ write-up, covering design choices, complexity proofs and discussion of results, 
 
 | File | Contents |
 |---|---|
-| `heapsort.py` | `max_heapify`, `build_max_heap`, `heapsort` (in place), `heapsorted` |
-| `other_sorts.py` | Randomized three-way Quicksort and top-down Merge Sort (baselines) |
-| `priority_queue.py` | `Task` dataclass and `PriorityQueue`: `insert`, `extract_max`/`extract_min`, `increase_key`, `decrease_key`, `is_empty`, `peek`, `remove` |
+| `heapsort.py` | `heapify`, `build_heap`, `heap_sort` (in place), `heap_sorted` |
+| `sorts.py` | Randomized three-way Quicksort and top-down Merge Sort (baselines) |
+| `priority_queue.py` | `Task` dataclass and `HeapPriorityQueue`: `insert`, `extract_max`/`extract_min`, `increase_key`, `decrease_key`, `is_empty`, `peek`, `remove` |
 | `scheduler.py` | Tick-based single-CPU scheduler: FCFS, Priority, Priority (preemptive), Priority + aging, EDF |
-| `benchmark.py` | Sorting times, comparison counts, and priority-queue operation timings |
-| `test_assignment4.py` | 25 unit tests covering all of the above |
-| `plot_style.py` | Shared graph styling |
+| `run_benchmarks.py` | Sorting times, comparison counts, and priority-queue operation timings |
+| `test_heaps.py` | 25 unit tests covering all of the above |
+| `chart_style.py` | Shared graph styling |
 | `results/` | CSV data, graphs and terminal output from the last full run |
 
 ## Requirements
@@ -35,7 +35,7 @@ pip install matplotlib
 ## Running the code
 
 ```bash
-python3 -m unittest -v test_assignment4
+python3 -m unittest -v test_heaps
 ```
 
 ```bash
@@ -51,7 +51,7 @@ python3 scheduler.py
 ```
 
 ```bash
-python3 benchmark.py
+python3 run_benchmarks.py
 ```
 
 * `python3 heapsort.py` shows a small heapsort demo.
@@ -59,10 +59,10 @@ python3 benchmark.py
   extract_max.
 * `python3 scheduler.py` prints a demo trace, then runs the full experiment (about 2
   seconds).
-* `python3 benchmark.py` runs the full sorting and priority-queue benchmark (about 1–2
+* `python3 run_benchmarks.py` runs the full sorting and priority-queue benchmark (about 1–2
   minutes).
 
-Both `scheduler.py` and `benchmark.py` accept `--quick` for a smaller run. Results go to
+Both `scheduler.py` and `run_benchmarks.py` accept `--quick` for a smaller run. Results go to
 `results/`.
 
 ## Summary of findings
